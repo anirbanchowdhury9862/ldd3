@@ -15,6 +15,7 @@
  * $Id: snull.c,v 1.21 2004/11/05 02:36:03 rubini Exp $
  */
 
+#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/moduleparam.h>
@@ -86,8 +87,6 @@ struct snull_priv {
 	u8 *tx_packetdata;
 	struct sk_buff *skb;
 	spinlock_t lock;
-	struct net_device *dev;
-	struct napi_struct napi;
 };
 
 static void snull_tx_timeout(struct net_device *dev);
@@ -285,15 +284,14 @@ void snull_rx(struct net_device *dev, struct snull_packet *pkt)
 /*
  * The poll implementation.
  */
-static int snull_poll(struct napi_struct *napi, int budget)
+static int snull_poll(struct net_device *dev, int *budget)
 {
-	int npackets = 0;
+	int npackets = 0, quota = min(dev->quota, *budget);
 	struct sk_buff *skb;
-	struct snull_priv *priv = container_of(napi, struct snull_priv, napi);
-	struct net_device *dev = priv->dev;
+	struct snull_priv *priv = netdev_priv(dev);
 	struct snull_packet *pkt;
     
-	while (npackets < budget && priv->rx_queue) {
+	while (npackets < quota && priv->rx_queue) {
 		pkt = snull_dequeue_buf(dev);
 		skb = dev_alloc_skb(pkt->datalen + 2);
 		if (! skb) {
@@ -317,13 +315,15 @@ static int snull_poll(struct napi_struct *napi, int budget)
 		snull_release_buffer(pkt);
 	}
 	/* If we processed all packets, we're done; tell the kernel and reenable ints */
+	*budget -= npackets;
+	dev->quota -= npackets;
 	if (! priv->rx_queue) {
-		napi_complete(napi);
+		netif_rx_complete(dev);
 		snull_rx_ints(dev, 1);
 		return 0;
 	}
 	/* We couldn't process everything. */
-	return npackets;
+	return 1;
 }
 	    
         
@@ -403,7 +403,7 @@ static void snull_napi_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 	priv->status = 0;
 	if (statusword & SNULL_RX_INTR) {
 		snull_rx_ints(dev, 0);  /* Disable further interrupts */
-		napi_schedule(&priv->napi);
+		netif_rx_schedule(dev);
 	}
 	if (statusword & SNULL_TX_INTR) {
         	/* a transmission is over: free the skb */
@@ -520,7 +520,7 @@ int snull_tx(struct sk_buff *skb, struct net_device *dev)
 		len = ETH_ZLEN;
 		data = shortpkt;
 	}
-	dev->trans_start = jiffies; /* save the timestamp */
+	dev->_tx->trans_start = jiffies; /* save the timestamp */
 
 	/* Remember the skb, so we can free it at interrupt time */
 	priv->skb = skb;
@@ -585,8 +585,8 @@ int snull_rebuild_header(struct sk_buff *skb)
 
 
 int snull_header(struct sk_buff *skb, struct net_device *dev,
-                unsigned short type, const void *daddr, const void *saddr,
-                unsigned len)
+                unsigned short type, void *daddr, void *saddr,
+                unsigned int len)
 {
 	struct ethhdr *eth = (struct ethhdr *)skb_push(skb,ETH_HLEN);
 
@@ -623,22 +623,6 @@ int snull_change_mtu(struct net_device *dev, int new_mtu)
 	return 0; /* success */
 }
 
-static const struct header_ops snull_header_ops = {
-        .create  = snull_header,
-	.rebuild = snull_rebuild_header
-};
-
-static const struct net_device_ops snull_netdev_ops = {
-	.ndo_open            = snull_open,
-	.ndo_stop            = snull_release,
-	.ndo_start_xmit      = snull_tx,
-	.ndo_do_ioctl        = snull_ioctl,
-	.ndo_set_config      = snull_config,
-	.ndo_get_stats       = snull_stats,
-	.ndo_change_mtu      = snull_change_mtu,
-	.ndo_tx_timeout      = snull_tx_timeout
-};
-
 /*
  * The init function (sometimes called probe).
  * It is invoked by register_netdev()
@@ -659,21 +643,32 @@ void snull_init(struct net_device *dev)
 	 * hand assignments
 	 */
 	ether_setup(dev); /* assign some of the fields */
+
+	dev->open            = snull_open;
+	dev->stop            = snull_release;
+	dev->set_config      = snull_config;
+	dev->hard_start_xmit = snull_tx;
+	dev->do_ioctl        = snull_ioctl;
+	dev->get_stats       = snull_stats;
+	dev->change_mtu      = snull_change_mtu;  
+	dev->rebuild_header  = snull_rebuild_header;
+	dev->hard_header     = snull_header;
+	dev->tx_timeout      = snull_tx_timeout;
 	dev->watchdog_timeo = timeout;
-	dev->netdev_ops = &snull_netdev_ops;
-	dev->header_ops = &snull_header_ops;
+	if (use_napi) {
+		dev->poll        = snull_poll;
+		dev->weight      = 2;
+	}
 	/* keep the default flags, just add NOARP */
 	dev->flags           |= IFF_NOARP;
-	dev->features        |= NETIF_F_HW_CSUM;
+	dev->features        |= NETIF_F_NO_CSUM;
+	dev->hard_header_cache = NULL;      /* Disable caching */
 
 	/*
 	 * Then, initialize the priv field. This encloses the statistics
 	 * and a few private fields.
 	 */
 	priv = netdev_priv(dev);
-	if (use_napi) {
-		netif_napi_add(dev, &priv->napi, snull_poll,2);
-	}
 	memset(priv, 0, sizeof(struct snull_priv));
 	spin_lock_init(&priv->lock);
 	snull_rx_ints(dev, 1);		/* enable receive interrupts */
